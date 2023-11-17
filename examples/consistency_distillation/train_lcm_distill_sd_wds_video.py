@@ -58,6 +58,7 @@ from diffusers import (
     DDPMScheduler,
     LCMScheduler,
     StableDiffusionPipeline,
+    DiffusionPipeline,
     UNet3DConditionModel,
 )
 from diffusers.optimization import get_scheduler
@@ -146,7 +147,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
     logger.info("Running validation... ")
 
     unet = accelerator.unwrap_model(unet)
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = DiffusionPipeline.from_pretrained(
         args.pretrained_teacher_model,
         vae=vae,
         unet=unet,
@@ -168,8 +169,8 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
     validation_prompts = [
         "portrait photo of a girl, photograph, highly detailed face, depth of field, moody light, golden hour, style by Dan Winters, Russell James, Steve McCurry, centered, extremely detailed, Nikon D850, award winning photography",
         "Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
-        "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
-        "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
+        # "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
+        # "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
     ]
 
     image_logs = []
@@ -182,7 +183,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
                 num_inference_steps=4,
                 num_images_per_prompt=4,
                 generator=generator,
-            ).images
+            ).frames
         image_logs.append({"validation_prompt": prompt, "images": images})
 
     for tracker in accelerator.trackers:
@@ -1053,17 +1054,19 @@ def main(args):
 
                 # CHANGE: here check if there is any special treatment in VAE during video encoding
                 # check decode_latents in pipeline_text_to_video_synth.py line 368
-                # [4, 16, 512, 512, 3]
+                # pixel_values torch.Size([2, 8, 256, 256, 3])
+                
                 pixel_values  = rearrange(pixel_values, "b t h w c -> (b t) c h w")
+                # pixel_values torch.Size([16, 3, 256, 256])
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 # latents = torch.cat(latents, dim=0)
 
                 latents = latents * vae.config.scaling_factor
                 latents = latents.to(weight_dtype)
                 
-                # Look at forward function of Unet3dConditionModel - (batch, num_frames, channel, height, width)
-                latents = rearrange(latents, "(b t) c h w -> b t c h w", b=args.train_batch_size, t = args.per_video_frames)
-
+                # Look at forward function of Unet3dConditionModel(wrong documentation) - (batch, channel, num_frames, height, width)
+                latents = rearrange(latents, "(b t) c h w -> b c t h w", b=args.train_batch_size, t = args.per_video_frames)
+                # latents torch.Size([2, 8, 4, 32, 32])
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -1088,14 +1091,15 @@ def main(args):
                 # 20.4.6. Sample a random guidance scale w from U[w_min, w_max] and embed it
                 w = (args.w_max - args.w_min) * torch.rand((bsz,)) + args.w_min
                 w_embedding = guidance_scale_embedding(w, embedding_dim=args.unet_time_cond_proj_dim)
-                w = w.reshape(bsz, 1, 1, 1)
+                # CHANGE adding another dimension for videos
+                w = w.reshape(bsz, 1, 1, 1, 1)
                 # Move to U-Net device and dtype
                 w = w.to(device=latents.device, dtype=latents.dtype)
                 w_embedding = w_embedding.to(device=latents.device, dtype=latents.dtype)
 
                 # 20.4.8. Prepare prompt embeds and unet_added_conditions
                 prompt_embeds = encoded_text.pop("prompt_embeds")
-
+                
                 # 20.4.9. Get online LCM prediction on z_{t_{n + k}}, w, c, t_{n + k}
                 noise_pred = unet(
                     noisy_model_input,
@@ -1104,6 +1108,7 @@ def main(args):
                     encoder_hidden_states=prompt_embeds.float(),
                     # added_cond_kwargs=encoded_text, # can be removed because encoded_text is empty after popping prompt_embeds
                 ).sample
+                # noise_pred - torch.Size([2, 4, 8, 32, 32])
 
                 pred_x_0 = predicted_origin(
                     noise_pred,
@@ -1113,6 +1118,7 @@ def main(args):
                     alpha_schedule,
                     sigma_schedule,
                 )
+                # pred_x_0- torch.Size([2, 4, 8, 32, 32])
 
                 model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x_0
 
@@ -1149,7 +1155,7 @@ def main(args):
                             alpha_schedule,
                             sigma_schedule,
                         )
-
+                        # breakpoint()
                         # 20.4.11. Perform "CFG" to get x_prev estimate (using the LCM paper's CFG formulation)
                         pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
                         pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
@@ -1224,8 +1230,12 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0:
-                        log_validation(vae, target_unet, args, accelerator, weight_dtype, global_step, "target")
-                        log_validation(vae, unet, args, accelerator, weight_dtype, global_step, "online")
+                        try:
+                            log_validation(vae, target_unet, args, accelerator, weight_dtype, global_step, "target")
+                            log_validation(vae, unet, args, accelerator, weight_dtype, global_step, "online")
+                        except:
+                            logger.info("Validation failed please check")
+                            print("Validation failed please check")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

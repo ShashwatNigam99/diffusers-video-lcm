@@ -162,7 +162,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step):
     logger.info("Running validation... ")
 
     unet = accelerator.unwrap_model(unet)
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = DiffusionPipeline.from_pretrained(
         args.pretrained_teacher_model,
         vae=vae,
         scheduler=LCMScheduler.from_pretrained(args.pretrained_teacher_model, subfolder="scheduler"),
@@ -188,8 +188,8 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step):
     validation_prompts = [
         "portrait photo of a girl, photograph, highly detailed face, depth of field, moody light, golden hour, style by Dan Winters, Russell James, Steve McCurry, centered, extremely detailed, Nikon D850, award winning photography",
         "Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
-        "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
-        "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
+        # "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
+        # "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
     ]
 
     image_logs = []
@@ -203,7 +203,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step):
                 num_images_per_prompt=4,
                 generator=generator,
                 guidance_scale=1.0,
-            ).images
+            ).frames
         image_logs.append({"validation_prompt": prompt, "images": images})
 
     for tracker in accelerator.trackers:
