@@ -34,13 +34,13 @@ import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
 import transformers
 import webdataset as wds
-from video2dataset.dataloader import get_video_dataset
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from braceexpand import braceexpand
 from huggingface_hub import create_repo
 from packaging import version
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from torch.utils.data import default_collate
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -58,13 +58,12 @@ from diffusers import (
     DDPMScheduler,
     LCMScheduler,
     StableDiffusionPipeline,
-    UNet3DConditionModel,
+    UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-from einops import rearrange
-from diffusers.models.embeddings import TimestepEmbedding
+
 
 MAX_SEQ_LENGTH = 77
 
@@ -75,6 +74,23 @@ if is_wandb_available():
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__)
+
+
+def get_module_kohya_state_dict(module, prefix: str, dtype: torch.dtype, adapter_name: str = "default"):
+    kohya_ss_state_dict = {}
+    for peft_key, weight in get_peft_model_state_dict(module, adapter_name=adapter_name).items():
+        kohya_key = peft_key.replace("base_model.model", prefix)
+        kohya_key = kohya_key.replace("lora_A", "lora_down")
+        kohya_key = kohya_key.replace("lora_B", "lora_up")
+        kohya_key = kohya_key.replace(".", "_", kohya_key.count(".") - 2)
+        kohya_ss_state_dict[kohya_key] = weight.to(dtype)
+
+        # Set alpha parameter
+        if "lora_down" in kohya_key:
+            alpha_key = f'{kohya_key.split(".")[0]}.alpha'
+            kohya_ss_state_dict[alpha_key] = torch.tensor(module.peft_config[adapter_name].lora_alpha).to(dtype)
+
+    return kohya_ss_state_dict
 
 
 class Text2VideoDataset:
@@ -142,21 +158,25 @@ class Text2VideoDataset:
         return self._train_dataloader
 
 
-def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="target"):
+def log_validation(vae, unet, args, accelerator, weight_dtype, step):
     logger.info("Running validation... ")
 
     unet = accelerator.unwrap_model(unet)
     pipeline = StableDiffusionPipeline.from_pretrained(
         args.pretrained_teacher_model,
         vae=vae,
-        unet=unet,
         scheduler=LCMScheduler.from_pretrained(args.pretrained_teacher_model, subfolder="scheduler"),
         revision=args.revision,
         torch_dtype=weight_dtype,
+        safety_checker=None,
     )
-    pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
+    lora_state_dict = get_module_kohya_state_dict(unet, "lora_unet", weight_dtype)
+    pipeline.load_lora_weights(lora_state_dict)
+    pipeline.fuse_lora()
+
+    pipeline = pipeline.to(accelerator.device, dtype=weight_dtype)
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
@@ -176,12 +196,13 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
 
     for _, prompt in enumerate(validation_prompts):
         images = []
-        with torch.autocast("cuda"):
+        with torch.autocast("cuda", dtype=weight_dtype):
             images = pipeline(
                 prompt=prompt,
                 num_inference_steps=4,
                 num_images_per_prompt=4,
                 generator=generator,
+                guidance_scale=1.0,
             ).images
         image_logs.append({"validation_prompt": prompt, "images": images})
 
@@ -207,7 +228,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, step, name="targe
                     image = wandb.Image(image, caption=validation_prompt)
                     formatted_images.append(image)
 
-            tracker.log({f"validation/{name}": formatted_images})
+            tracker.log({"validation": formatted_images})
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
@@ -379,7 +400,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="lcm-xl-distilled",
+        default="lcm-video-lora-distilled",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -387,12 +408,6 @@ def parse_args():
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
-        "--unet_time_cond_proj_dim",
-        type=int,
-        default=512,
-        help="Time conditional projection dimension for the U-Net.", #check this change. used dimension used as default in guidance_scale_embeddings function
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     # ----Logging----
@@ -484,10 +499,7 @@ def parse_args():
     )
     # ----Batch Size and Training Steps----
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument(
-        "--per_video_frames", type=int, default=16, help="Number of frames per video to use for training."
+        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -594,13 +606,11 @@ def parse_args():
         default=0.001,
         help="The huber loss parameter. Only used if `--loss_type=huber`.",
     )
-    # ----Exponential Moving Average (EMA)----
     parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=0.95,
-        required=False,
-        help="The exponential moving average (EMA) rate or decay factor.",
+        "--lora_rank",
+        type=int,
+        default=64,
+        help="The rank of the LoRA projection matrix.",
     )
     # ----Mixed Precision----
     parser.add_argument(
@@ -658,7 +668,7 @@ def parse_args():
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2video-fine-tune",
+        default="text2image-fine-tune",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -778,8 +788,9 @@ def main(args):
         revision=args.teacher_revision,
     )
 
-    # 5. Load teacher U-Net from SD-XL checkpoint (or more stable U-Net)
-    teacher_unet = UNet3DConditionModel.from_pretrained(
+    # 5. Load teacher U-Net from SD-XL checkpoint 
+    # change
+    teacher_unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_teacher_model, subfolder="unet", revision=args.teacher_revision
     )
 
@@ -788,26 +799,13 @@ def main(args):
     text_encoder.requires_grad_(False)
     teacher_unet.requires_grad_(False)
 
-    # 8. Create online (`unet`) student U-Nets. This will be updated by the optimizer (e.g. via backpropagation.)
-    # Add `time_cond_proj_dim` to the student U-Net if `teacher_unet.config.time_cond_proj_dim` is None
-    # if teacher_unet.config.time_cond_proj_dim is None:
-    # turns out there is no time_cond_proj_dim in the teacher_unet config # check if this is correct
-    # moving this down below because it messes up with Unet
-    teacher_unet.config["time_cond_proj_dim"] = args.unet_time_cond_proj_dim
-        
-    unet = UNet3DConditionModel(**teacher_unet.config)
-    # load teacher_unet weights into unet
-    unet.load_state_dict(teacher_unet.state_dict(), strict=False)
+    # 7. Create online (`unet`) student U-Nets.
+    # change
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_teacher_model, subfolder="unet", revision=args.teacher_revision
+    )
     unet.train()
 
-    # 9. Create target (`ema_unet`) student U-Net parameters. This will be updated via EMA updates (polyak averaging).
-    # Initialize from unet
-    target_unet = UNet3DConditionModel(**teacher_unet.config)
-    target_unet.load_state_dict(unet.state_dict())
-    target_unet.train()
-    target_unet.requires_grad_(False)
-        
-    
     # Check that all trainable models are in full precision
     low_precision_error_string = (
         " Please make sure to always have all model weights in full float32 precision when starting training - even if"
@@ -819,7 +817,29 @@ def main(args):
             f"Controlnet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
         )
 
-    # 10. Handle mixed precision and device placement
+    # 8. Add LoRA to the student U-Net, only the LoRA projection matrix will be updated by the optimizer.
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        target_modules=[
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "proj_in",
+            "proj_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "conv1",
+            "conv2",
+            "conv_shortcut",
+            "downsamplers.0.conv",
+            "upsamplers.0.conv",
+            "time_emb_proj",
+        ],
+    )
+    unet = get_peft_model(unet, lora_config)
+
+    # 9. Handle mixed precision and device placement
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -836,7 +856,6 @@ def main(args):
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # Move teacher_unet to device, optionally cast to weight_dtype
-    target_unet.to(accelerator.device)
     teacher_unet.to(accelerator.device)
     if args.cast_teacher_unet:
         teacher_unet.to(dtype=weight_dtype)
@@ -846,40 +865,35 @@ def main(args):
     sigma_schedule = sigma_schedule.to(accelerator.device)
     solver = solver.to(accelerator.device)
 
-    # 11. Handle saving and loading of checkpoints
+    # 10. Handle saving and loading of checkpoints
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                target_unet.save_pretrained(os.path.join(output_dir, "unet_target"))
+                unet_ = accelerator.unwrap_model(unet)
+                lora_state_dict = get_peft_model_state_dict(unet_, adapter_name="default")
+                StableDiffusionPipeline.save_lora_weights(os.path.join(output_dir, "unet_lora"), lora_state_dict)
+                # save weights in peft format to be able to load them back
+                unet_.save_pretrained(output_dir)
 
-                for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
-
+                for _, model in enumerate(models):
                     # make sure to pop weight so that corresponding model is not saved again
                     weights.pop()
 
         def load_model_hook(models, input_dir):
-            load_model = UNet3DConditionModel.from_pretrained(os.path.join(input_dir, "unet_target"))
-            target_unet.load_state_dict(load_model.state_dict())
-            target_unet.to(accelerator.device)
-            del load_model
+            # load the LoRA into the model
+            unet_ = accelerator.unwrap_model(unet)
+            unet_.load_adapter(input_dir, "default", is_trainable=True)
 
-            for i in range(len(models)):
+            for _ in range(len(models)):
                 # pop models so that they are not loaded again
-                model = models.pop()
-
-                # load diffusers style into model
-                load_model = UNet3DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                model.register_to_config(**load_model.config)
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                models.pop()
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    # 12. Enable optimizations
+    # 11. Enable optimizations
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
@@ -891,7 +905,7 @@ def main(args):
                 )
             unet.enable_xformers_memory_efficient_attention()
             teacher_unet.enable_xformers_memory_efficient_attention()
-            target_unet.enable_xformers_memory_efficient_attention()
+            # target_unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
@@ -930,15 +944,11 @@ def main(args):
     def compute_embeddings(prompt_batch, proportion_empty_prompts, text_encoder, tokenizer, is_train=True):
         prompt_embeds = encode_prompt(prompt_batch, text_encoder, tokenizer, proportion_empty_prompts, is_train)
         return {"prompt_embeds": prompt_embeds}
-    # breakpoint()
-    # MAJOR CHANGE
-    # Edit for text2video dataset
-    dataset = Text2VideoDataset(
+
+    dataset = Text2ImageDataset(
         train_shards_path_or_url=args.train_shards_path_or_url,
         num_train_examples=args.max_train_samples,
         per_gpu_batch_size=args.train_batch_size,
-        # CHANGE - add new parameter for number of frames per video
-        per_video_frames=args.per_video_frames,
         global_batch_size=args.train_batch_size * accelerator.num_processes,
         num_workers=args.dataloader_num_workers,
         resolution=args.resolution,
@@ -1041,28 +1051,23 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
-                video, text = batch["mp4"], batch["txt"]
-                
-                video = video.to(accelerator.device, non_blocking=True)
+                image, text, _, _ = batch
 
+                image = image.to(accelerator.device, non_blocking=True)
                 encoded_text = compute_embeddings_fn(text)
-                pixel_values = video.to(dtype=weight_dtype)
 
+                pixel_values = image.to(dtype=weight_dtype)
                 if vae.dtype != weight_dtype:
                     vae.to(dtype=weight_dtype)
 
-                # CHANGE: here check if there is any special treatment in VAE during video encoding
-                # check decode_latents in pipeline_text_to_video_synth.py line 368
-                # [4, 16, 512, 512, 3]
-                pixel_values  = rearrange(pixel_values, "b t h w c -> (b t) c h w")
-                latents = vae.encode(pixel_values).latent_dist.sample()
-                # latents = torch.cat(latents, dim=0)
+                # encode pixel values with batch size of at most 32
+                latents = []
+                for i in range(0, pixel_values.shape[0], 32):
+                    latents.append(vae.encode(pixel_values[i : i + 32]).latent_dist.sample())
+                latents = torch.cat(latents, dim=0)
 
                 latents = latents * vae.config.scaling_factor
                 latents = latents.to(weight_dtype)
-                
-                # Look at forward function of Unet3dConditionModel - (batch, num_frames, channel, height, width)
-                latents = rearrange(latents, "(b t) c h w -> b t c h w", b=args.train_batch_size, t = args.per_video_frames)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -1087,11 +1092,8 @@ def main(args):
 
                 # 20.4.6. Sample a random guidance scale w from U[w_min, w_max] and embed it
                 w = (args.w_max - args.w_min) * torch.rand((bsz,)) + args.w_min
-                w_embedding = guidance_scale_embedding(w, embedding_dim=args.unet_time_cond_proj_dim)
                 w = w.reshape(bsz, 1, 1, 1)
-                # Move to U-Net device and dtype
                 w = w.to(device=latents.device, dtype=latents.dtype)
-                w_embedding = w_embedding.to(device=latents.device, dtype=latents.dtype)
 
                 # 20.4.8. Prepare prompt embeds and unet_added_conditions
                 prompt_embeds = encoded_text.pop("prompt_embeds")
@@ -1100,9 +1102,9 @@ def main(args):
                 noise_pred = unet(
                     noisy_model_input,
                     start_timesteps,
-                    timestep_cond=w_embedding,
+                    timestep_cond=None,
                     encoder_hidden_states=prompt_embeds.float(),
-                    # added_cond_kwargs=encoded_text, # can be removed because encoded_text is empty after popping prompt_embeds
+                    added_cond_kwargs=encoded_text,
                 ).sample
 
                 pred_x_0 = predicted_origin(
@@ -1158,10 +1160,10 @@ def main(args):
                 # 20.4.12. Get target LCM prediction on x_prev, w, c, t_n
                 with torch.no_grad():
                     with torch.autocast("cuda", dtype=weight_dtype):
-                        target_noise_pred = target_unet(
+                        target_noise_pred = unet(
                             x_prev.float(),
                             timesteps,
-                            timestep_cond=w_embedding,
+                            timestep_cond=None,
                             encoder_hidden_states=prompt_embeds.float(),
                         ).sample
                     pred_x_0 = predicted_origin(
@@ -1192,8 +1194,6 @@ def main(args):
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                # 20.4.15. Make EMA update to target student model parameters
-                update_ema(target_unet.parameters(), unet.parameters(), args.ema_decay)
                 progress_bar.update(1)
                 global_step += 1
 
@@ -1224,8 +1224,7 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0:
-                        log_validation(vae, target_unet, args, accelerator, weight_dtype, global_step, "target")
-                        log_validation(vae, unet, args, accelerator, weight_dtype, global_step, "online")
+                        log_validation(vae, unet, args, accelerator, weight_dtype, global_step)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1238,10 +1237,9 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
-        unet.save_pretrained(os.path.join(args.output_dir, "unet"))
-
-        target_unet = accelerator.unwrap_model(target_unet)
-        target_unet.save_pretrained(os.path.join(args.output_dir, "unet_target"))
+        unet.save_pretrained(args.output_dir)
+        lora_state_dict = get_peft_model_state_dict(unet, adapter_name="default")
+        StableDiffusionPipeline.save_lora_weights(os.path.join(args.output_dir, "unet_lora"), lora_state_dict)
 
     accelerator.end_training()
 
